@@ -1,0 +1,211 @@
+/* * ---------------------------------------------------------------------
+#  *  Author        : Julio Carranza
+#  *  Name          : nologssdbrand.slax
+#  *  Version       : 1.00, 2016-09-07
+#  *                  1.01, Event are embedded in the script, and
+#  *                  syslog messages are added for debugging.
+#  *                  1.02, It supports if a match expression
+#  *                  already exists
+#  *
+#  *  Last Modified : 2016-09-16
+#  *  Script Type   : op/event
+#  *  Description   : script checks if the master RE has in ad1 an
+#  *                  ssdbrand SSD to apply "set system syslog file
+#  *                  messages match “!(.*Offline uncorrectable
+#  *                  sectors.*)”. Configure "set systems syslog
+#  *                  apply-macro ssdbrandsyslog $file" to specify
+#  *                  to which file the match condition is applied
+#  *                  Don't type $file, instead use messages or
+#  *                  any syslog destination. If a match condition
+#  *                  exists, it will append the expression
+#  *                  (.*Offline uncorrectable sectors.*). Old
+#  *                  expression is stored in an apply-macro to
+#  *                  restore if a RE switchover happens and the
+#  *                  new master RE doesn't have ssdbrand SSD.
+#  *				  The logs for this script will be tagged
+#  *				  with the keyword 'cscript'.
+#  *
+#  *  Router config : Please add the following configs to the MX
+#  *				  router on which above mentioned log filtering
+#  *                  is required:
+#  *
+#  *	# set system syslog apply-macro ssdbrandsyslog <file-name>
+#  *	# set event-options event-script file nologssdbrand.slax
+#  *
+#  *				  Copy this script 'nologssdbrand.slax' to the
+#  *                  '/var/db/scripts/event' directory.
+#  *
+#  */
+
+version 1.0;
+
+ns junos = "http://xml.juniper.net/junos/*/junos";
+ns xnm = "http://xml.juniper.net/xnm/1.1/xnm";
+ns jcs = "http://xml.juniper.net/junos/commit-scripts/1.0";
+import "../import/junos.xsl";
+
+/* Embedded event policy */
+var $event-definition = {
+    <event-options> {
+        <policy> {
+            <name> "nologssdbrand";
+            <events> "rpd_start";
+            <then>{
+                <event-script>{
+                    <name> "nologssdbrand.slax";
+                }
+            }
+        }
+    }
+}
+
+match /{
+
+  var $ssdmatch = '!(.*Offline uncorrectable sectors.*)';
+  /* Retrieve the current configuration */
+  var $configuration = jcs:invoke( "get-configuration" );
+  if ($configuration/system/syslog/apply-macro[name="ssdbrandsyslog"]/data/name) {
+    mvar $change :={};
+    var $syslogfile = $configuration/system/syslog/apply-macro[name="ssdbrandsyslog"]/data/name;
+
+    /* Pull the routing-engine name from $junos-context */
+    var $local-re = $junos-context/routing-engine-name;
+
+    /* Retrieve show chassis hardware detail to store ada1 model per RE*/
+    var $cmd1 = <get-chassis-inventory> {
+      <detail>;
+    }
+    var $chassisdetail = jcs:invoke( $cmd1 );
+    var $adare0 = $chassisdetail/chassis/chassis-module[name="Routing Engine 0"]/chassis-re-disk-module[name="ada2"]/model;
+    var $adare1 = $chassisdetail/chassis/chassis-module[name="Routing Engine 1"]/chassis-re-disk-module[name="ada1"]/model;
+
+    /* Adds math condition to syslog if master re has ssdbrand model */
+    if (($local-re == "re0" && starts-with($adare0, "SDB95")) || ($local-re == "re1" && starts-with($adare1, "SDB95"))) {
+      expr jcs:output( "Master RE has ssdbrand SSD");
+      expr jcs:syslog( "external.error", "Master RE has ssdbrand SSD" );
+      if (not(contains($configuration/system/syslog/file[name=$syslogfile]/match, "!(.*Offline uncorrectable sectors.*)"))) {
+        if ($configuration/system/syslog/file[name=$syslogfile]/match) {
+          var $match = $configuration/system/syslog/file[name=$syslogfile]/match;
+          var $oldmatch = jcs:split("\n", $match);
+		  var $newmatch = $oldmatch _ "|" _ $ssdmatch;
+          set $change = {
+            <configuration> {
+              <system> {
+                <syslog> {
+                  <file> {
+					<name> $syslogfile;
+                    <apply-macro>{
+                      <name> "matchconditions";
+                      <data> {
+                        <name> "previousvalue";
+                        <value> '"' _ $oldmatch _ '"';
+                      }
+                    }
+
+                    <match> $newmatch;
+                  }
+                }
+              }
+            }
+          }
+        }
+        else {
+
+			set $change = {
+				<configuration> {
+					<system> {
+						<syslog> {
+							<file> {
+								<name> $syslogfile;
+								<match> $ssdmatch;
+							}
+						}
+					}
+				}
+			}
+
+        }
+
+
+        /* Load and commit the configuration change */
+        var $connection = jcs:open();
+        var $results := {
+          call jcs:load-configuration( $connection, $configuration = $change );
+        }
+        var $close-results = jcs:close( $connection );
+
+        /* Report either errors or success */
+        if( $results//xnm:error ) {
+          expr jcs:syslog( "external.error", "Commit Error: ", message );
+		  expr jcs:output( "Commit Error: ", message);
+        }
+        else {
+			expr jcs:syslog( "external.error", $local-re, " has ssdbrand SSD, syslog match condition was applied" );
+			expr jcs:output( "Syslog match condition was configured");
+        }
+      }
+      else {
+        expr jcs:output( "No changes applied, syslog match condition already configured");
+        expr jcs:syslog( "external.error", "No changes applied, syslog match condition already configured" );
+      }
+    }
+    else {
+      expr jcs:output( "Master RE does not have ssdbrand SSD");
+      expr jcs:syslog( "external.info", "Master RE does not have ssdbrand SSD" );
+      if (contains($configuration/system/syslog/file[name=$syslogfile]/match, "!(.*Offline uncorrectable sectors.*)")) {
+        if ( $configuration/system/syslog/file[name=$syslogfile]/apply-macro[name='matchconditions']/data[name='previousvalue']/value) {
+          var $match = $configuration/system/syslog/file[name=$syslogfile]/apply-macro[name='matchconditions']/data[name='previousvalue']/value;
+          var $oldmatch = jcs:split("\n", $match);
+		  set $change = {
+            <configuration> {
+              <system> {
+                <syslog> {
+                  <file> {
+                    <name> $syslogfile;
+                    <match> $oldmatch;
+                    <apply-macro delete = "delete">;
+                  }
+                }
+              }
+            }
+          }
+        }
+        else {
+          set $change = {
+            <configuration> {
+              <system> {
+                <syslog> {
+                  <file> {
+                    <name> $syslogfile;
+                    <match delete = "delete">;
+                  }
+                }
+              }
+            }
+          }
+        }
+        /* Load and commit the configuration change */
+        var $connection = jcs:open();
+        var $results := {
+          call jcs:load-configuration( $connection, $configuration=$change );
+        }
+        var $close-results = jcs:close( $connection );
+
+        /* Report either errors or success */
+        if( $results//xnm:error ) {
+          expr jcs:syslog( "external.error", "Commit Error: ", message );
+		  expr jcs:output( "Commit Error: ", message);
+        }
+        else {
+         expr jcs:syslog( "external.error", $local-re, " does not have ssdbrand SSD, syslog match condition was deleted" );
+         expr jcs:output( "Syslog match condition was deleted");
+        }
+      }
+    }
+  }
+  else {
+    expr jcs:output( "To execute this nologssdbrand script, specify the syslog host with 'set system syslog apply-macro ssdbrandsyslog $host'");
+    expr jcs:syslog( "To execute this nologssdbrand script, specify the syslog host with 'set system syslog apply-macro ssdbrandsyslog $host'" );
+
+  }
+}
